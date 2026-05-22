@@ -1,0 +1,118 @@
+id: ultrareview
+description: Launch a multi-agent in-depth code review of the current worktree or PR
+variables:
+  - name: ARGUMENTS
+    description: Optional pull request number. If omitted, review the current worktree's pending changes.
+template: |
+  You are the coordinator for an in-depth, multi-perspective code review.
+
+  Your job is NOT to review the diff yourself. Your job is to:
+  1. Gather the change once.
+  2. Fan out NINE specialized reviewer subagents in parallel, each examining the
+     change from one angle.
+  3. Aggregate, deduplicate, and rank their findings into a single report.
+
+  PR number (optional): $ARGUMENTS
+
+  === STEP 1: GATHER THE CHANGE ===
+
+  If a PR number is provided in the args:
+    - Run `gh pr view $ARGUMENTS` to confirm the PR exists and capture its title.
+    - Run `gh pr diff $ARGUMENTS` to obtain the full unified diff.
+
+  If no PR number is provided:
+    - Run `git status` and `git diff HEAD` to obtain the pending changes
+      (staged + unstaged) in the current worktree.
+
+  Write a ONE-SENTENCE summary of the change surface. This summary plus the
+  diff will be passed verbatim to every reviewer subagent.
+
+  === STEP 2: FAN OUT REVIEWERS IN PARALLEL ===
+
+  In a SINGLE assistant turn, launch all TEN Agent tool calls below at once.
+  Each call MUST set `isolation: "worktree"` so the reviewer runs against an
+  isolated copy of the repo and cannot interfere with peers.
+
+  For each call, pass a prompt that contains exactly:
+    - The one-sentence change summary.
+    - The full diff (or PR number so the reviewer can re-fetch).
+    - The reviewer's lane reminder: "Stay strictly inside your lane. Other
+      reviewers cover the other angles. Report under 250 words."
+
+  The ten reviewer subagent_type values to spawn:
+
+    1. reviewer-correctness        - logic, edge cases, off-by-ones, control flow
+    2. reviewer-security           - injection, auth, secret leakage, unsafe blocks
+    3. reviewer-performance        - allocations, hot paths, blocking in async
+    4. reviewer-concurrency        - races, Send/Sync, locks, channels, async
+    5. reviewer-error-handling     - Result/Option handling, panic paths, ? misuse
+    6. reviewer-architecture       - module boundaries, coupling, premature abstraction
+    7. reviewer-rust-idioms        - lifetimes, ownership, traits, iterators, ? chains
+    8. reviewer-testing            - coverage gaps, missing failure-mode tests
+    9. reviewer-api-contract       - docstrings on public fns, breaking changes, semver
+   10. reviewer-null-safety        - null/undefined/None/nil access, removed guards,
+                                     optional chaining gaps (language-agnostic)
+
+  Do NOT launch them sequentially. Do NOT skip any of the ten. Do NOT add
+  reviewers. The matrix is fixed so the aggregation step can rely on it.
+
+  === STEP 3: AGGREGATE FINDINGS ===
+
+  After all nine subagent results have returned:
+
+    a. Parse each subagent's findings. Each finding should have a severity tag
+       in [BLOCKER], [SHOULD-FIX], or [NIT].
+    b. Deduplicate: if two reviewers flagged the same file:line for the same
+       root cause, merge them and credit both lanes.
+    c. Rank by severity, then by file path.
+    d. For each finding, ensure it cites file:line.
+
+  SEVERITY GUARDRAILS:
+    - Promote SUBSTANTIVE findings (real bug, null-safety gap, security
+      issue, data race, error-handling defect) above coverage / testing /
+      docstring findings. Lead each severity section with substantive ones.
+    - If the ONLY finding across all reviewers is from reviewer-testing or
+      reviewer-api-contract (i.e., missing tests / missing docstrings) and
+      no other reviewer flagged anything substantive, DOWNGRADE that finding
+      to SHOULD-FIX (or NIT if it was already SHOULD-FIX). A PR with only-
+      coverage concerns is not blocking; emitting BLOCKER in that case is
+      over-eager.
+    - When a substantive finding exists, do NOT also emit a separate Blocker
+      about "missing tests for the buggy line" — fold that into the
+      substantive finding's recommended fix as "(also: regression test)".
+
+  === STEP 4: REPORT ===
+
+  Output a single markdown report in EXACTLY this structure. No prose before or
+  after the report.
+
+  ```
+  # Ultrareview Report
+
+  **Change summary:** <one sentence>
+  **Reviewers run:** 9
+  **Total findings:** <N>  (Blockers: <a>, Should-fix: <b>, Nits: <c>)
+
+  ## Blockers
+  - [path/to/file.rs:42] (correctness, security) <one-line title>
+    <2-3 sentence explanation and concrete recommendation>
+
+  ## Should-fix
+  - [path/to/file.rs:108] (performance) <title>
+    <explanation>
+
+  ## Nits
+  - [path/to/file.rs:200] (style) <title>
+
+  ## Executive summary
+  <Two sentences. Top risk + one clear next action.>
+  ```
+
+  If a section has zero findings, write `- (none)` under it.
+
+  === HARD RULES ===
+  - You MUST NOT perform the review yourself before fan-out.
+  - You MUST NOT skip any of the nine reviewer subagents.
+  - You MUST set `isolation: "worktree"` on every Agent call.
+  - You MUST cite file:line for every finding in the final report.
+  - You MUST keep the final report under 2000 words.

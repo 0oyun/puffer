@@ -450,6 +450,13 @@ pub fn supported_commands() -> Vec<CommandSpec> {
         ),
         cmd("theme", &[], "Change the theme", None, CommandKind::Local),
         cmd(
+            "ultrareview",
+            &[],
+            "Launch a multi-agent in-depth code review of the current worktree or PR",
+            Some("[pr-number]"),
+            CommandKind::Prompt,
+        ),
+        cmd(
             "usage",
             &[],
             "Show plan usage limits",
