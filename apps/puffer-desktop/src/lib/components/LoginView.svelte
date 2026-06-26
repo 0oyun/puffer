@@ -24,35 +24,19 @@
 
   const PROVIDER_DISPLAY_ORDER = [
     "anthropic",
-    "github-copilot",
     "openai",
-    "google",
     "openrouter",
     "vercel-ai-gateway",
     "custom"
   ];
 
+  // NOTE: Google and GitHub Copilot are intentionally not offered here. They
+  // have no backend support: there is no provider descriptor for either, no
+  // Gemini text-execution adapter, and the OAuth flow only routes the OpenAI /
+  // Anthropic families (so Copilot OAuth cannot run). Offering them produced
+  // dead-end setup entries that always failed. Re-add them once real
+  // descriptors + auth/execution paths exist.
   const EXTRA_SETUP_PROVIDERS: ProviderSummary[] = [
-    {
-      id: "github-copilot",
-      displayName: "GitHub Copilot",
-      baseUrl: "https://api.githubcopilot.com",
-      defaultApi: "openai-completions",
-      modelCount: 0,
-      authModes: ["oauth"],
-      sourceKind: "ui-setup",
-      sourcePath: null
-    },
-    {
-      id: "google",
-      displayName: "Google",
-      baseUrl: "https://generativelanguage.googleapis.com",
-      defaultApi: "openai-completions",
-      modelCount: 0,
-      authModes: ["api_key"],
-      sourceKind: "ui-setup",
-      sourcePath: null
-    },
     {
       id: "openrouter",
       displayName: "OpenRouter",

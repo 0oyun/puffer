@@ -38,16 +38,18 @@ test("provider cards describe model families instead of model counts", async ({ 
   await daemon.install(page);
   await daemon.open(page, { forceOnboarding: true, skipOnboarding: false });
 
-  const googleCard = page.locator(".provider-card").filter({ hasText: "Google" }).last();
-  await expect(googleCard).toContainText("Gemini models for quick, structured responses.");
-  await expect(googleCard).not.toContainText(/\b\d+ models?\b/);
-  const googleIconBox = await googleCard.locator('img[src="/service-icons/google.svg"]').boundingBox();
-  expect(googleIconBox?.width).toBeCloseTo(23, 1);
-  expect(googleIconBox?.height).toBeCloseTo(23, 1);
+  const anthropicCard = page.locator(".provider-card").filter({ hasText: "Anthropic" }).last();
+  await expect(anthropicCard).toContainText("Direct Claude model access, including Pro and Max plans.");
+  await expect(anthropicCard).not.toContainText(/\b\d+ models?\b/);
+  const anthropicIconBox = await anthropicCard
+    .locator('img[src="/service-icons/anthropic.svg"]')
+    .boundingBox();
+  expect(anthropicIconBox?.width).toBeCloseTo(23, 1);
+  expect(anthropicIconBox?.height).toBeCloseTo(23, 1);
 
-  await googleCard.getByRole("button", { name: "Add connect" }).click();
-  const modal = page.getByRole("dialog", { name: "Connect Google" });
-  await expect(modal).toContainText("Gemini models for quick, structured responses.");
+  await anthropicCard.getByRole("button", { name: "Add connect" }).click();
+  const modal = page.getByRole("dialog", { name: "Connect Anthropic" });
+  await expect(modal).toContainText("Direct Claude model access, including Pro and Max plans.");
   await expect(modal).not.toContainText(/\b\d+ models? available\b/);
 });
 
