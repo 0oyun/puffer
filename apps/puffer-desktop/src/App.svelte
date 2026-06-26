@@ -3545,6 +3545,20 @@
         statusMessage = `Turn ${turnId.slice(0, 8)} already finished.`;
         return;
       }
+      // The interrupt was accepted. Clear any pending prompts for this turn now
+      // so the user can keep working even if the backend's settle event
+      // (turn-complete / workspace-settled) is delayed or never arrives. The
+      // turn itself stays marked active (Stop turn remains, disabled) until that
+      // settle event lands.
+      if (currentTurnId === turnId) {
+        liveStreamItems = withoutLivePromptsForTurn(liveStreamItems, turnId);
+        turnQuestionLookup = Object.fromEntries(
+          Object.entries(turnQuestionLookup).filter(([, mapping]) => mapping.turnId !== turnId)
+        );
+        turnPermissionLookup = Object.fromEntries(
+          Object.entries(turnPermissionLookup).filter(([, mapping]) => mapping.turnId !== turnId)
+        );
+      }
       statusMessage = `Cancel requested for turn ${turnId.slice(0, 8)}.`;
     } catch (error) {
       if (currentTurnId !== turnId) return;
@@ -4147,6 +4161,21 @@
 
   function withoutLiveItemsForTurn(items: TimelineItem[], turnId: string): TimelineItem[] {
     return items.filter((item) => !liveItemBelongsToTurn(item, turnId));
+  }
+
+  // Drop only the pending interaction prompts (permission gates and
+  // AskUserQuestion) for a turn, preserving any streamed assistant/tool output.
+  // Used when the user interrupts a turn so the session is not left blocking on
+  // a prompt that can no longer be answered.
+  function withoutLivePromptsForTurn(items: TimelineItem[], turnId: string): TimelineItem[] {
+    return items.filter(
+      (item) =>
+        !(
+          item.id.startsWith(`live-gate-${turnId}-`) ||
+          item.id.startsWith(`live-perm-${turnId}-`) ||
+          item.id.startsWith(`live-question-${turnId}-`)
+        )
+    );
   }
 
   function snapshotFromTransientState(state: TransientConversationState): StreamAttemptSnapshot {
