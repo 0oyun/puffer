@@ -103,6 +103,15 @@ struct BrowserToolInput {
     query: Option<String>,
     #[serde(default, rename = "ref")]
     ref_id: Option<String>,
+    // Viewport pixel coordinates for clickAt / moveMouse. Kept as raw Value so
+    // a number or numeric string both pass through to the daemon, which parses
+    // them tolerantly. Without these fields serde would silently drop x/y.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    x: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    y: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    count: Option<u32>,
     #[serde(default)]
     value: Option<String>,
     #[serde(default)]

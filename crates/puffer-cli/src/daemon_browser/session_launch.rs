@@ -36,7 +36,15 @@ pub(super) fn configure_chrome_command(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-background-networking")
-        .arg("--disable-features=Translate")
+        // Stealth: hide the AutomationControlled blink flag and present a normal
+        // Chrome UA (the default headless UA leaks "HeadlessChrome"), so
+        // behavioral anti-bot checks see a less suspicious browser.
+        .arg("--disable-blink-features=AutomationControlled")
+        .arg(
+            "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
+             AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
+        )
+        .arg("--disable-features=Translate,IsolateOrigins,site-per-process")
         .arg("--disable-gpu")
         .arg("--enable-extensions")
         .arg("--allow-file-access")

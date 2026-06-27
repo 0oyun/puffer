@@ -242,6 +242,47 @@ pub(crate) fn handle_browser_agent(state: &Arc<DaemonState>, params: &Value) -> 
             state.browsers.agent_click(&backend_id, &target)?;
             Ok(state.browsers.post_action_snapshot(&backend_id, json!({ "ok": true }), true))
         }
+        // Coordinate-based click. Unlike `click` (which needs a snapshot `ref`),
+        // this dispatches a real mouse click at viewport pixel (x, y); the
+        // browser's hit-testing routes it into whatever is under the point —
+        // including cross-origin iframes (reCAPTCHA checkbox / challenge tiles)
+        // that the DOM snapshot cannot surface as refs. The move is split into a
+        // few steps with small delays so it reads as human pointer motion rather
+        // than an instantaneous teleport.
+        "clickAt" => {
+            let (_, backend_id) =
+                ensure_target_tab(state, &root_session_id, params, width, height)?;
+            state.browsers.arm_agent_recording(&backend_id);
+            let x = coord_param(params, "x")
+                .ok_or_else(|| anyhow::anyhow!("clickAt requires numeric `x`"))?;
+            let y = coord_param(params, "y")
+                .ok_or_else(|| anyhow::anyhow!("clickAt requires numeric `y`"))?;
+            let click_count = optional_u32(params, "count").unwrap_or(1).max(1);
+            state
+                .browsers
+                .agent_click_at(&backend_id, x, y, click_count)?;
+            Ok(state.browsers.post_action_snapshot(
+                &backend_id,
+                json!({ "ok": true, "x": x, "y": y }),
+                true,
+            ))
+        }
+        // Move the pointer to (x, y) without clicking — useful to build up
+        // human-like pointer telemetry before a click, which behavioral
+        // anti-bot scorers (reCAPTCHA v3 / checkbox) weigh.
+        "moveMouse" => {
+            let (_, backend_id) =
+                ensure_target_tab(state, &root_session_id, params, width, height)?;
+            state.browsers.arm_agent_recording(&backend_id);
+            let x = coord_param(params, "x")
+                .ok_or_else(|| anyhow::anyhow!("moveMouse requires numeric `x`"))?;
+            let y = coord_param(params, "y")
+                .ok_or_else(|| anyhow::anyhow!("moveMouse requires numeric `y`"))?;
+            state.browsers.agent_move_mouse(&backend_id, x, y)?;
+            Ok(state
+                .browsers
+                .post_action_snapshot(&backend_id, json!({ "ok": true, "x": x, "y": y }), false))
+        }
         "dblclick" => {
             let (_, backend_id) =
                 ensure_target_tab(state, &root_session_id, params, width, height)?;
@@ -496,6 +537,51 @@ impl BrowserRegistry {
             buttons: Some(0),
             click_count: 0,
         })?;
+        Ok(())
+    }
+
+    /// Clicks at a raw viewport pixel coordinate (no snapshot ref). The
+    /// browser's hit-testing routes the click into whatever is under the point,
+    /// including cross-origin iframes that the DOM snapshot cannot expose as
+    /// refs (e.g. the reCAPTCHA checkbox or challenge tiles).
+    pub(crate) fn agent_click_at(
+        &self,
+        backend_session_id: &str,
+        x: f64,
+        y: f64,
+        click_count: u32,
+    ) -> Result<()> {
+        let session = self.get(backend_session_id)?;
+        dispatch_humanized_move(&session, x, y)?;
+        thread::sleep(Duration::from_millis(45));
+        for c in 1..=click_count.max(1) {
+            session.input(BrowserInputEvent::Mouse {
+                event_type: "mousePressed".to_string(),
+                x,
+                y,
+                button: "left".to_string(),
+                buttons: Some(1),
+                click_count: c,
+            })?;
+            thread::sleep(Duration::from_millis(55));
+            session.input(BrowserInputEvent::Mouse {
+                event_type: "mouseReleased".to_string(),
+                x,
+                y,
+                button: "left".to_string(),
+                buttons: Some(0),
+                click_count: c,
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Moves the pointer to a raw viewport pixel coordinate with human-like
+    /// multi-step motion (no click). Useful to build pointer telemetry that
+    /// behavioral anti-bot scorers weigh before a click.
+    pub(crate) fn agent_move_mouse(&self, backend_session_id: &str, x: f64, y: f64) -> Result<()> {
+        let session = self.get(backend_session_id)?;
+        dispatch_humanized_move(&session, x, y)?;
         Ok(())
     }
 
@@ -1166,6 +1252,57 @@ fn dispatch_agent_mouse_click(
         button: "left".to_string(),
         buttons: Some(0),
         click_count,
+    })
+}
+
+/// Reads a coordinate param tolerantly: accepts a JSON float, integer, or a
+/// numeric string (models sometimes emit `"339"` instead of `339`). Returns
+/// None only when the value is absent or unparseable.
+fn coord_param(params: &Value, key: &str) -> Option<f64> {
+    let v = params.get(key)?;
+    v.as_f64()
+        .or_else(|| v.as_i64().map(|n| n as f64))
+        .or_else(|| v.as_u64().map(|n| n as f64))
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+}
+
+/// Tiny deterministic sub-pixel wobble (~±1.5px) so a synthesized pointer path
+/// is not a perfectly straight line — no RNG dependency, varies by step.
+fn pointer_jitter(step: usize, salt: usize) -> f64 {
+    (((step * 37 + salt * 101) % 7) as f64 - 3.0) * 0.5
+}
+
+/// Moves the pointer to (x, y) over a few eased, slightly-jittered steps with
+/// small inter-step delays, ending exactly on the target. Approximates human
+/// pointer motion instead of an instantaneous teleport, which matters to
+/// behavioral anti-bot scoring (reCAPTCHA checkbox / v3).
+fn dispatch_humanized_move(session: &BrowserSession, x: f64, y: f64) -> Result<()> {
+    let start_x = x - 26.0;
+    let start_y = y - 19.0;
+    let steps = 4usize;
+    for i in 1..=steps {
+        let t = i as f64 / steps as f64;
+        let ease = t * t * (3.0 - 2.0 * t); // smoothstep
+        let mx = start_x + (x - start_x) * ease + pointer_jitter(i, 1);
+        let my = start_y + (y - start_y) * ease + pointer_jitter(i, 2);
+        session.input(BrowserInputEvent::Mouse {
+            event_type: "mouseMoved".to_string(),
+            x: mx,
+            y: my,
+            button: "none".to_string(),
+            buttons: Some(0),
+            click_count: 0,
+        })?;
+        thread::sleep(Duration::from_millis(16 + (i as u64) * 8));
+    }
+    // Settle exactly on the target so the press lands where intended.
+    session.input(BrowserInputEvent::Mouse {
+        event_type: "mouseMoved".to_string(),
+        x,
+        y,
+        button: "none".to_string(),
+        buttons: Some(0),
+        click_count: 0,
     })
 }
 

@@ -63,6 +63,8 @@ input_schema:
         - openConsoleLogs
         - openScreenshot
         - click
+        - clickAt
+        - moveMouse
         - dblclick
         - hover
         - focus_ref
@@ -79,7 +81,7 @@ input_schema:
         - scroll
         - scrollIntoView
         - evaluate
-      description: Browser action to perform. Use open for creating or reusing a tab at a URL; openScreenshot and openConsoleLogs wait for DOM readiness, not full network idle.
+      description: Browser action to perform. Use open for creating or reusing a tab at a URL; openScreenshot and openConsoleLogs wait for DOM readiness, not full network idle. Use clickAt (with x,y) to click a raw viewport pixel when the target has no snapshot ref — e.g. controls inside cross-origin iframes such as a reCAPTCHA checkbox or image-challenge tiles; read the pixel position from a screenshot. moveMouse moves the pointer to x,y without clicking.
     sessionId:
       type: string
       description: Puffer session id. Defaults to the current agent session.
@@ -103,6 +105,16 @@ input_schema:
     ref:
       type: string
       description: Fresh element ref from the latest snapshot for ref-based actions, such as @e1.
+    x:
+      type: number
+      description: Viewport pixel x-coordinate for clickAt or moveMouse.
+    y:
+      type: number
+      description: Viewport pixel y-coordinate for clickAt or moveMouse.
+    count:
+      type: integer
+      minimum: 1
+      description: Click count for clickAt (1 = single, 2 = double). Defaults to 1.
     value:
       type: string
       description: Exact option value or label text for select actions.

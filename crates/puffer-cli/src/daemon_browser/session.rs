@@ -61,6 +61,35 @@ use pending::PendingKind;
 const CEF_REMOTE_START_TIMEOUT: Duration = Duration::from_secs(30);
 const CEF_TARGET_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Injected into every new document (before page scripts) to mask the most
+/// common headless/automation fingerprints that behavioral anti-bot systems
+/// (reCAPTCHA checkbox / v3, Turnstile) check first.
+const STEALTH_INIT_SCRIPT: &str = r#"
+(() => {
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
+  try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
+  try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
+  try { Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] }); } catch (e) {}
+  try {
+    const q = navigator.permissions && navigator.permissions.query;
+    if (q) {
+      navigator.permissions.query = (p) =>
+        p && p.name === 'notifications'
+          ? Promise.resolve({ state: Notification.permission })
+          : q(p);
+    }
+  } catch (e) {}
+  try {
+    const gp = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function (p) {
+      if (p === 37445) return 'Intel Inc.';
+      if (p === 37446) return 'Intel Iris OpenGL Engine';
+      return gp.call(this, p);
+    };
+  } catch (e) {}
+})();
+"#;
+
 /// The native-CEF remote debugging port, if the desktop configured one. Used to
 /// decide whether tab discovery may lazily attach to an existing CEF (#649)
 /// without risking a managed-Chrome launch.
@@ -695,6 +724,15 @@ fn run_cdp_worker(
     let mut next_id = 1u64;
     let mut pending = HashMap::<u64, PendingKind>::new();
     let _ = send_cdp(&mut socket, &mut next_id, "Page.enable", json!({}));
+    // Stealth: blunt the most common automation tells before any page script
+    // runs, so behavioral anti-bot checks (reCAPTCHA checkbox / v3) are less
+    // likely to escalate. Runs in every new document on this target.
+    let _ = send_cdp(
+        &mut socket,
+        &mut next_id,
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": STEALTH_INIT_SCRIPT }),
+    );
     let _ = send_cdp(&mut socket, &mut next_id, "Runtime.enable", json!({}));
     let _ = send_cdp(&mut socket, &mut next_id, "DOM.enable", json!({}));
     let _ = send_cdp(&mut socket, &mut next_id, "Log.enable", json!({}));
