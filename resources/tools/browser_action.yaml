@@ -81,7 +81,8 @@ input_schema:
         - scroll
         - scrollIntoView
         - evaluate
-      description: Browser action to perform. Use open for creating or reusing a tab at a URL; openScreenshot and openConsoleLogs wait for DOM readiness, not full network idle. Use clickAt (with x,y) to click a raw viewport pixel when the target has no snapshot ref — e.g. controls inside cross-origin iframes such as a reCAPTCHA checkbox or image-challenge tiles; read the pixel position from a screenshot. moveMouse moves the pointer to x,y without clicking.
+        - solveCaptcha
+      description: Browser action to perform. Use open for creating or reusing a tab at a URL; openScreenshot and openConsoleLogs wait for DOM readiness, not full network idle. Use clickAt (with x,y) to click a raw viewport pixel when the target has no snapshot ref — e.g. controls inside cross-origin iframes such as a reCAPTCHA checkbox or image-challenge tiles; read the pixel position from a screenshot. moveMouse moves the pointer to x,y without clicking. solveCaptcha autonomously solves a reСAPTCHA v2 on the page via its audio challenge and a local whisper model (count = max rounds, default 3) — you normally do not need to call it, as a snapshot's captcha field triggers solving automatically.
     sessionId:
       type: string
       description: Puffer session id. Defaults to the current agent session.

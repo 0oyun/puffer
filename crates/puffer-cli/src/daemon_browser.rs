@@ -18,6 +18,14 @@ use url::Url;
 use crate::daemon::ServerEnvelope;
 
 mod agent;
+#[cfg(feature = "captcha-audio")]
+mod captcha_audio;
+#[cfg(feature = "captcha-image")]
+mod captcha_image;
+#[cfg(feature = "captcha-image")]
+mod captcha_clip;
+#[cfg(feature = "captcha-image")]
+mod captcha_clipseg;
 mod cdp;
 mod cef;
 mod chrome;
