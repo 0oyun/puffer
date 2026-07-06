@@ -134,9 +134,16 @@ pub(crate) fn handle_browser_agent(state: &Arc<DaemonState>, params: &Value) -> 
             state.browsers.navigate(&backend_id, url)?;
             state.browsers.focus_tab(&root_session_id, &tab_id)?;
             publish_tabs(state, &root_session_id);
-            Ok(serde_json::to_value(
-                state.browsers.list_tabs(&root_session_id),
-            )?)
+            let mut result = serde_json::to_value(state.browsers.list_tabs(&root_session_id))?;
+            // Autonomously clear a reCAPTCHA the navigation landed on, so the agent
+            // continues its task without the model having to handle the challenge.
+            #[cfg(feature = "captcha-audio")]
+            if let Some(outcome) = state.browsers.auto_solve_if_captcha(&backend_id) {
+                if let Some(obj) = result.as_object_mut() {
+                    obj.insert("captchaSolve".to_string(), outcome);
+                }
+            }
+            Ok(result)
         }
         "reload" => {
             let (_, backend_id) =
@@ -282,6 +289,26 @@ pub(crate) fn handle_browser_agent(state: &Arc<DaemonState>, params: &Value) -> 
             Ok(state
                 .browsers
                 .post_action_snapshot(&backend_id, json!({ "ok": true, "x": x, "y": y }), false))
+        }
+        // Autonomously solve a reCAPTCHA v2 on the page via its audio challenge +
+        // a local whisper model (feature `captcha-audio`). `count` = max rounds.
+        "solveCaptcha" => {
+            let (_, backend_id) =
+                ensure_target_tab(state, &root_session_id, params, width, height)?;
+            state.browsers.arm_agent_recording(&backend_id);
+            #[cfg(feature = "captcha-audio")]
+            {
+                let max_rounds = optional_u32(params, "count").unwrap_or(3).max(1);
+                let outcome = state.browsers.agent_solve_captcha(&backend_id, max_rounds)?;
+                Ok(state
+                    .browsers
+                    .post_action_snapshot(&backend_id, outcome, true))
+            }
+            #[cfg(not(feature = "captcha-audio"))]
+            {
+                let _ = &backend_id;
+                bail!("solveCaptcha requires building puffer with the `captcha-audio` feature")
+            }
         }
         "dblclick" => {
             let (_, backend_id) =
@@ -583,6 +610,786 @@ impl BrowserRegistry {
         let session = self.get(backend_session_id)?;
         dispatch_humanized_move(&session, x, y)?;
         Ok(())
+    }
+
+    /// Autonomously solves a reCAPTCHA v2 challenge via its AUDIO option using a
+    /// local whisper model (feature `captcha-audio`). Works because Puffer runs
+    /// Chrome with site isolation disabled (`--disable-features=site-per-process`),
+    /// so the cross-origin reСAPTCHA frames share the renderer and we can run JS in
+    /// them via `Page.createIsolatedWorld`. The challenge mp3 is fetched inside the
+    /// (google-origin) bframe and returned as base64, so the daemon needs no proxy.
+    /// Returns `{ solved, rounds?, note?, log }`. Never throws on a normal miss —
+    /// a `try again later` block returns `solved:false` so the caller can move on.
+    #[cfg(feature = "captcha-audio")]
+    /// ONE solve attempt: opens the challenge and solves it via audio (Whisper), or
+    /// via the CLIP/CLIPSeg image path when `force_image` is set. Returns a `note`
+    /// the orchestrator reads to decide retries — "audio-blocked" (doscaptcha "try
+    /// again later") tells it to REFRESH THE PAGE and try again; after enough audio
+    /// blocks the orchestrator forces the image path.
+    fn solve_captcha_attempt(
+        &self,
+        backend_session_id: &str,
+        max_rounds: u32,
+        force_image: bool,
+    ) -> Result<Value> {
+        use base64::Engine as _;
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let session = self.get(backend_session_id)?;
+        // Page domain must be enabled so the (cross-site, same-process) reCAPTCHA
+        // frames register in the frame registry — otherwise createIsolatedWorld
+        // rejects their id with "No frame for given id found".
+        let _ = session.cdp_call("Page.enable", json!({}));
+        thread::sleep(Duration::from_millis(300));
+        let mut log: Vec<String> = Vec::new();
+        let checked_js = "document.querySelector('#recaptcha-anchor')?.getAttribute('aria-checked')";
+        // The bframe (challenge) frame is pre-created and empty; it "has content"
+        // only once a challenge actually opens. Used to tell an opened challenge
+        // from a stale empty frame.
+        let bframe_has_content = "!!(document.querySelector('#recaptcha-audio-button')||document.querySelector('table td')||document.querySelector('.rc-doscaptcha-header,.rc-doscaptcha-body'))";
+
+        // The reCAPTCHA frames attach a few seconds AFTER navigation returns (the
+        // api.js loads from google.com), so poll rather than sampling once too early
+        // — otherwise an explicit solve right after a goto reports a false "no
+        // recaptcha".
+        let (mut anchor, mut bframe) = (None, None);
+        for _ in 0..16 {
+            let (a, b) = recaptcha_frame_ids(&session)?;
+            if a.is_some() || b.is_some() {
+                anchor = a;
+                bframe = b;
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        if anchor.is_none() && bframe.is_none() {
+            return Ok(json!({ "solved": false, "note": "no recaptcha", "log": log, "debug": recaptcha_debug(&session) }));
+        }
+        if std::env::var("PUFFER_CAPTCHA_DEBUG").is_ok() {
+            let ftree = session.cdp_call("Page.getFrameTree", json!({})).ok();
+            let create_try = anchor.as_ref().or(bframe.as_ref()).map(|f| {
+                match session.cdp_call(
+                    "Page.createIsolatedWorld",
+                    json!({ "frameId": f, "worldName": "dbg" }),
+                ) {
+                    Ok(v) => format!("OK:{v}"),
+                    Err(e) => format!("ERR:{e:#}"),
+                }
+            });
+            return Ok(json!({
+                "debug": recaptcha_debug(&session),
+                "anchor": anchor, "bframe": bframe,
+                "createWorldTry": create_try,
+                "frameTree": ftree,
+            }));
+        }
+        if let Some(a) = &anchor {
+            if eval_in_frame(&session, a, checked_js)?.as_str() == Some("true") {
+                return Ok(json!({ "solved": true, "note": "already solved", "log": log }));
+            }
+        }
+        // Open the challenge with a TRUSTED coordinate click on the checkbox
+        // (behavioral scoring weighs this), computing coords from the anchor
+        // iframe's rect in the top document. The bframe frame is PRE-created and
+        // empty before any click, so treat a contentless bframe as "not opened"
+        // and still click the checkbox — otherwise Puffer acts on a blank frame.
+        let bframe_ready = match &bframe {
+            Some(b) => eval_in_frame(&session, b, bframe_has_content)?.as_bool() == Some(true),
+            None => false,
+        };
+        if !bframe_ready {
+            bframe = None;
+            // Click the checkbox and CONFIRM it took — the anchor's bframe frame
+            // exists before any click, so "a bframe id exists" is not proof the
+            // challenge opened. Retry the click (it sometimes misses) until either
+            // the box is checked (silent pass) or the bframe actually has content.
+            'checkbox: for attempt in 0..3u32 {
+                let coords = session
+                    .evaluate(
+                        "(()=>{const f=[...document.querySelectorAll('iframe')].find(i=>(i.src||'').includes('api2/anchor'));if(!f)return null;const r=f.getBoundingClientRect();return {x:r.left+30,y:r.top+r.height/2};})()"
+                            .to_string(),
+                    )
+                    .ok()
+                    .map(|e| e.value);
+                if let Some(obj) = coords.as_ref().and_then(Value::as_object) {
+                    let x = obj.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+                    let y = obj.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+                    if x > 0.0 && y > 0.0 {
+                        let _ = self.agent_click_at(backend_session_id, x, y, 1);
+                        log.push(format!("click-checkbox{}", attempt + 1));
+                    }
+                }
+                // human pause after clicking, then watch for the outcome
+                thread::sleep(Duration::from_millis(rng.gen_range(900..1700)));
+                for _ in 0..10 {
+                    let (a2, b2) = recaptcha_frame_ids(&session)?;
+                    if let Some(a) = &a2 {
+                        if eval_in_frame(&session, a, checked_js)?.as_str() == Some("true") {
+                            return Ok(json!({ "solved": true, "note": "silent pass", "log": log }));
+                        }
+                    }
+                    if let Some(b) = &b2 {
+                        if eval_in_frame(&session, b, bframe_has_content)?.as_bool() == Some(true) {
+                            bframe = Some(b.clone());
+                            break 'checkbox;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+                log.push("checkbox-missed".to_string());
+                thread::sleep(Duration::from_millis(rng.gen_range(500..1100)));
+            }
+        }
+        let Some(bframe) = bframe else {
+            return Ok(json!({ "solved": false, "note": "no challenge frame", "log": log }));
+        };
+        // The bframe exists early but empty — wait for the challenge UI (audio button,
+        // image grid, or the doscaptcha block) to actually render before acting, so we
+        // don't read a blank frame and give up.
+        for _ in 0..16 {
+            let ready = eval_in_frame(
+                &session,
+                &bframe,
+                "!!(document.querySelector('#recaptcha-audio-button')||document.querySelector('table td')||document.querySelector('.rc-doscaptcha-header,.rc-doscaptcha-body'))",
+            )
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+            if ready {
+                break;
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        // IMAGE path: taken when the orchestrator forces it (audio blocked earlier /
+        // on cooldown) or PUFFER_CAPTCHA_IMAGE_ONLY is set. It never clicks the audio
+        // button, so it can't trip the "try again later" doscaptcha. CLIP is
+        // open-vocab (3×3) and CLIPSeg segments the 4×4 area grids.
+        let image_only = std::env::var_os("PUFFER_CAPTCHA_IMAGE_ONLY").is_some();
+        #[cfg(feature = "captcha-image")]
+        if image_only || force_image {
+            let task0 = eval_in_frame(
+                &session,
+                &bframe,
+                "(()=>{const s=document.querySelector('.rc-imageselect-desc strong,strong');return s?s.innerText:'';})()",
+            )
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+            log.push(format!("img0:{task0}"));
+            // Generous round budget so a legit multi-step challenge chain (each
+            // Verify reveals another grid) can be followed to completion instead of
+            // being abandoned half-solved (which reads as a bot). Real reloads are
+            // separately capped, and verify_fails only accrues on real rejections.
+            let (ok, ilog) = self.solve_image_challenge(backend_session_id, &bframe, &anchor, max_rounds.max(18));
+            log.extend(ilog);
+            return Ok(json!({
+                "solved": ok,
+                "note": if ok { "solved via image" } else { "image: unsolved" },
+                "log": log,
+            }));
+        }
+        // AUDIO attempt (single). On a doscaptcha block we return note "audio-blocked"
+        // so the orchestrator can REFRESH THE PAGE (fresh widget) and retry; the image
+        // fallback is the orchestrator's decision after N audio blocks, not inline.
+        let ab = eval_in_frame(
+            &session,
+            &bframe,
+            "(()=>{const b=document.querySelector('#recaptcha-audio-button');if(!b)return 'no-audio-btn';b.click();return 'clicked-audio';})()",
+        )
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| "eval-err".to_string());
+        log.push(format!("audiobtn:{ab}"));
+        // human pause while the audio panel loads / as if listening
+        thread::sleep(Duration::from_millis(rng.gen_range(1500..2400)));
+
+        for round in 0..max_rounds.max(1) {
+            if eval_in_frame(
+                &session,
+                &bframe,
+                "!!document.querySelector('.rc-doscaptcha-header,.rc-doscaptcha-body')",
+            )?
+            .as_bool()
+                == Some(true)
+            {
+                log.push("blocked".to_string());
+                // Audio is rate-limited ("try again later"). The whole widget is now
+                // poisoned (image in it is blocked too), so the ONLY recovery is a
+                // fresh page. Hand back "audio-blocked" — the orchestrator refreshes
+                // the page and retries (audio again, or image after enough blocks).
+                return Ok(json!({ "solved": false, "note": "audio-blocked", "log": log }));
+            }
+            // Fetch the challenge mp3 from inside the (google-origin) bframe → base64.
+            let mut b64 = String::new();
+            for _ in 0..8 {
+                let v = eval_in_frame(
+                    &session,
+                    &bframe,
+                    "(async()=>{const a=document.querySelector('.rc-audiochallenge-tdownload-link');if(!a)return '';try{const r=await fetch(a.href);const u=new Uint8Array(await r.arrayBuffer());let s='';for(let i=0;i<u.length;i++)s+=String.fromCharCode(u[i]);return btoa(s);}catch(e){return '';}})()",
+                )?;
+                if let Some(s) = v.as_str() {
+                    if !s.is_empty() {
+                        b64 = s.to_string();
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(700));
+            }
+            if b64.is_empty() {
+                let state = eval_in_frame(
+                    &session,
+                    &bframe,
+                    "JSON.stringify({dl:!!document.querySelector('.rc-audiochallenge-tdownload-link'),audio:!!document.querySelector('#audio-source,audio'),playbtn:!!document.querySelector('.rc-audiochallenge-play-button,button.rc-button-default'),instr:(document.querySelector('.rc-audiochallenge-instructions')||{}).innerText||'',err:(document.querySelector('.rc-audiochallenge-error-message')||{}).innerText||'',body:(document.body?document.body.innerText:'').slice(0,120)})",
+                )
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default();
+                log.push(format!("no-audio {state}"));
+                break;
+            }
+            let mp3 = base64::engine::general_purpose::STANDARD
+                .decode(b64.as_bytes())
+                .unwrap_or_default();
+            let text = match super::captcha_audio::transcribe(&mp3) {
+                Ok(t) => t,
+                Err(error) => {
+                    log.push(format!("asr-err:{error:#}"));
+                    break;
+                }
+            };
+            log.push(format!("asr:{}", text.chars().take(40).collect::<String>()));
+            if text.trim().is_empty() {
+                let _ = eval_in_frame(
+                    &session,
+                    &bframe,
+                    "(()=>{const r=document.querySelector('#recaptcha-reload-button');if(r)r.click();})()",
+                );
+                thread::sleep(Duration::from_millis(2500));
+                continue;
+            }
+            // Human-like: type the answer, pause as if reviewing it, THEN submit —
+            // filling and clicking verify in the same instant reads as a bot.
+            let fill_js = format!(
+                "(()=>{{const i=document.querySelector('#audio-response');if(!i)return 'no-input';i.focus();i.value={};i.dispatchEvent(new Event('input',{{bubbles:true}}));return 'filled';}})()",
+                serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".to_string())
+            );
+            let _ = eval_in_frame(&session, &bframe, &fill_js);
+            thread::sleep(Duration::from_millis(rng.gen_range(800..1600)));
+            let _ = eval_in_frame(
+                &session,
+                &bframe,
+                "(()=>{const v=document.querySelector('#recaptcha-verify-button');if(v)v.click();})()",
+            );
+            thread::sleep(Duration::from_millis(rng.gen_range(2800..3600)));
+            if let Some(a) = &anchor {
+                if eval_in_frame(&session, a, checked_js)?.as_str() == Some("true") {
+                    log.push("PASS".to_string());
+                    return Ok(json!({ "solved": true, "rounds": round + 1, "log": log }));
+                }
+            }
+            if let Ok(tok) = session.evaluate(
+                "(()=>{try{return (grecaptcha&&grecaptcha.getResponse&&grecaptcha.getResponse())||''}catch(e){return ''}})()"
+                    .to_string(),
+            ) {
+                if tok.value.as_str().map(|s| !s.is_empty()).unwrap_or(false) {
+                    log.push("PASS-token".to_string());
+                    return Ok(json!({ "solved": true, "rounds": round + 1, "log": log }));
+                }
+            }
+            log.push(format!("retry{}", round + 1));
+            thread::sleep(Duration::from_millis(1200));
+        }
+        // Audio was served but we couldn't solve it (no mp3 / empty ASR / wrong
+        // answers). Report "audio-failed" so the orchestrator refreshes + moves on.
+        Ok(json!({ "solved": false, "note": "audio-failed", "log": log }))
+    }
+
+    /// Orchestrates the autonomous solve: try AUDIO first, and on a "try again
+    /// later" doscaptcha block REFRESH THE PAGE and retry — up to `PUFFER_CAPTCHA_
+    /// AUDIO_ATTEMPTS` (default 2) audio tries — then fall back to the IMAGE solver
+    /// on the next fresh page. Also skips audio entirely for a cooldown window after
+    /// a recent block (so repeated navigations don't keep re-tripping doscaptcha),
+    /// and honours PUFFER_CAPTCHA_IMAGE_ONLY.
+    #[cfg(feature = "captcha-audio")]
+    pub(crate) fn agent_solve_captcha(&self, backend_session_id: &str, max_rounds: u32) -> Result<Value> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_AUDIO_BLOCK_MS: AtomicU64 = AtomicU64::new(0);
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        };
+        let cooldown_ms = std::env::var("PUFFER_CAPTCHA_AUDIO_COOLDOWN_S")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(480)
+            * 1000;
+        let max_audio = std::env::var("PUFFER_CAPTCHA_AUDIO_ATTEMPTS")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(2);
+        let image_only = std::env::var_os("PUFFER_CAPTCHA_IMAGE_ONLY").is_some();
+        let mut audio_fails = 0u32;
+        let mut agg: Vec<String> = Vec::new();
+        // audio attempts (each may refresh) + up to 2 image attempts after.
+        for attempt in 0..(max_audio + 2) {
+            let cooling = now_ms().saturating_sub(LAST_AUDIO_BLOCK_MS.load(Ordering::Relaxed)) < cooldown_ms;
+            let force_image = image_only || cooling || audio_fails >= max_audio;
+            if attempt > 0 {
+                agg.push(format!("--attempt{}{}", attempt + 1, if force_image { ":image" } else { ":audio" }));
+            }
+            let r = self.solve_captcha_attempt(backend_session_id, max_rounds, force_image)?;
+            if let Some(l) = r.get("log").and_then(Value::as_array) {
+                agg.extend(l.iter().filter_map(|v| v.as_str().map(String::from)));
+            }
+            if r.get("solved").and_then(Value::as_bool) == Some(true) {
+                let mut out = r.clone();
+                out["log"] = json!(agg);
+                return Ok(out);
+            }
+            let note = r.get("note").and_then(Value::as_str).unwrap_or("");
+            // Terminal states — nothing to retry.
+            if matches!(note, "no recaptcha" | "already solved" | "silent pass" | "no challenge frame") {
+                let mut out = r.clone();
+                out["log"] = json!(agg);
+                return Ok(out);
+            }
+            // The image attempt already retries internally (reloads, multi-step,
+            // wall-clock deadline). Don't re-run it — that just multiplies the time
+            // budget and re-solves fresh grids pointlessly. One image attempt is final.
+            if force_image {
+                let mut out = r.clone();
+                out["log"] = json!(agg);
+                return Ok(out);
+            }
+            // Both a doscaptcha block and a served-but-unsolved audio round count as
+            // an audio failure; after `max_audio` of them the next attempt forces
+            // image. Only a real block starts the skip-audio cooldown.
+            if note == "audio-blocked" || note == "audio-failed" {
+                audio_fails += 1;
+            }
+            if note == "audio-blocked" {
+                LAST_AUDIO_BLOCK_MS.store(now_ms(), Ordering::Relaxed);
+            }
+            // Audio blocked or failed, or image attempt failed → refresh the page for
+            // a clean widget and try again (next attempt forces image once audio is
+            // exhausted / cooling).
+            self.reload_page_for_captcha(backend_session_id);
+        }
+        Ok(json!({ "solved": false, "note": "exhausted", "log": agg }))
+    }
+
+    /// Refresh the page and wait for a fresh reCAPTCHA widget to attach — the only
+    /// way to recover from a doscaptcha-poisoned widget.
+    #[cfg(feature = "captcha-audio")]
+    fn reload_page_for_captcha(&self, backend_session_id: &str) {
+        let Ok(session) = self.get(backend_session_id) else {
+            return;
+        };
+        let _ = session.cdp_call("Page.reload", json!({ "ignoreCache": false }));
+        // Give the reload + reСAPTCHA script time to re-attach the frames.
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(500));
+            if let Ok((anchor, bframe)) = recaptcha_frame_ids(&session) {
+                if anchor.is_some() || bframe.is_some() {
+                    thread::sleep(Duration::from_millis(800));
+                    return;
+                }
+            }
+        }
+    }
+
+    /// IMAGE-challenge fallback (feature `captcha-image`): when the audio option is
+    /// blocked, solve the visible grid with the native YOLO detector. Reads the
+    /// grid geometry + task from the bframe, screenshots just the grid, detects the
+    /// matching tiles, clicks them (humanized) and verifies — with human-like dwell
+    /// throughout. Reloads on an empty detection, retries up to `max_rounds`.
+    #[cfg(feature = "captcha-image")]
+    fn solve_image_challenge(
+        &self,
+        backend_session_id: &str,
+        bframe: &str,
+        _anchor: &Option<String>,
+        max_rounds: u32,
+    ) -> (bool, Vec<String>) {
+        use base64::Engine as _;
+        use rand::Rng;
+        let mut log: Vec<String> = Vec::new();
+        let Ok(session) = self.get(backend_session_id) else {
+            return (false, log);
+        };
+        let mut rng = rand::thread_rng();
+        // Control-loop state across rounds. `verify_fails` bounds pointless
+        // re-verifies of a rejected grid; whether to Verify is decided per-grid from
+        // its own selection state (any_selected), not a cross-grid flag.
+        let mut verify_fails = 0u32;
+        // Cap reloads: hammering "new challenge" is the single biggest bot tell and
+        // burns the session's reputation (→ doscaptcha block). A human reloads a
+        // couple of times at most.
+        let mut reloads = 0u32;
+        let max_reloads = 3u32;
+        // Cap the multi-step chain. A legit reCAPTCHA challenge resolves in 1–3
+        // steps; an endless stream of new challenges that never accepts is the
+        // low-trust "doscaptcha-lite" trap — grinding it just wastes time and is
+        // itself a bot tell (a human never solves 8 in a row). Give up past this.
+        let mut next_steps = 0u32;
+        let max_next_steps = std::env::var("PUFFER_CLIP_MAX_STEPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5u32);
+        // Wall-clock deadline so a hard multi-step/dynamic chain returns with its log
+        // instead of being killed by the caller's outer timeout (which loses the log
+        // and reads as a hang). Env-tunable.
+        let deadline = std::time::Instant::now()
+            + Duration::from_secs(
+                std::env::var("PUFFER_CLIP_DEADLINE_S").ok().and_then(|v| v.parse().ok()).unwrap_or(90),
+            );
+        for round in 0..max_rounds.max(1) {
+            if std::time::Instant::now() >= deadline {
+                log.push("img:time-cap".to_string());
+                break;
+            }
+            // SETTLE FIRST: before reading the task/geometry or clicking anything,
+            // wait until the grid is fully rendered — every tile image loaded AND the
+            // src list unchanged across two reads. Doing this at the TOP means the
+            // task, geometry and clicks below all act on ONE stable challenge, so a
+            // click can't land on a grid still transitioning to the next challenge
+            // (cross-challenge mis-touch, "上下题误触").
+            {
+                let mut prev_grid: Option<String> = None;
+                for _ in 0..24 {
+                    let st = eval_in_frame(
+                        &session,
+                        bframe,
+                        "(()=>{const im=[...document.querySelectorAll('table td img')];const allc=im.length?im.every(i=>i.complete&&i.naturalWidth>0):false;return JSON.stringify({allc:allc,s:im.map(i=>i.src).join('|')});})()",
+                    )
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .unwrap_or(Value::Null);
+                    let all_loaded = st.get("allc").and_then(Value::as_bool).unwrap_or(false);
+                    let cur_grid = st.get("s").and_then(Value::as_str).map(String::from);
+                    if all_loaded && cur_grid.is_some() && cur_grid == prev_grid {
+                        break;
+                    }
+                    if cur_grid.is_some() {
+                        prev_grid = cur_grid;
+                    }
+                    thread::sleep(Duration::from_millis(170));
+                }
+            }
+            // Grid geometry + tile count + task word + per-tile SELECTED state.
+            // The td "…selected" class is reCAPTCHA's own record of what we've
+            // already picked — the source of truth that unifies one-shot (tiles
+            // stay selected → verify when all matches selected) and dynamic
+            // (clicked tiles fade to a NEW image, unselected → keep clicking).
+            let meta_raw = eval_in_frame(
+                &session,
+                bframe,
+                "(()=>{const t=document.querySelector('table');if(!t)return '';const r=t.getBoundingClientRect();const tds=[...t.querySelectorAll('td')];const isSel=(td)=>{const c=td.className||'';if(/selected/i.test(c))return true;if(td.getAttribute('aria-pressed')==='true')return true;const cm=td.querySelector('.rc-imageselect-checkmark');if(cm){const st=getComputedStyle(cm);if(parseFloat(st.opacity||'0')>0.1&&st.display!=='none'&&st.visibility!=='hidden')return true;}return false;};const sel=tds.map(td=>isSel(td)?1:0);const s=document.querySelector('.rc-imageselect-desc strong,strong');const dbg=tds.slice(0,3).map(td=>td.className+'|ap='+td.getAttribute('aria-pressed')+'|cm='+((td.querySelector('.rc-imageselect-checkmark')||{}).style?getComputedStyle(td.querySelector('.rc-imageselect-checkmark')).opacity:'none'));return JSON.stringify({x:r.left,y:r.top,w:r.width,h:r.height,cells:tds.length,task:s?s.innerText:'',sel:sel,dbg:dbg});})()",
+            )
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+            let meta: Value = serde_json::from_str(&meta_raw).unwrap_or(Value::Null);
+            let task = meta.get("task").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let cells = meta.get("cells").and_then(Value::as_u64).unwrap_or(0) as usize;
+            if task.is_empty() || cells == 0 {
+                log.push("img:no-grid".to_string());
+                break;
+            }
+            if !super::captcha_clip::can_handle(&task) {
+                log.push(format!("img:cant-handle:{task}"));
+                break;
+            }
+            let rows = if cells >= 16 { 4 } else { 3 };
+            // bframe iframe position in the top document → absolute grid rect.
+            let bf = session
+                .evaluate(
+                    "(()=>{const f=[...document.querySelectorAll('iframe')].find(i=>(i.src||'').includes('api2/bframe'));if(!f)return null;const r=f.getBoundingClientRect();return {x:r.left,y:r.top};})()"
+                        .to_string(),
+                )
+                .ok()
+                .map(|e| e.value)
+                .unwrap_or(Value::Null);
+            let gx = bf.get("x").and_then(Value::as_f64).unwrap_or(0.0) + meta.get("x").and_then(Value::as_f64).unwrap_or(0.0);
+            let gy = bf.get("y").and_then(Value::as_f64).unwrap_or(0.0) + meta.get("y").and_then(Value::as_f64).unwrap_or(0.0);
+            let gw = meta.get("w").and_then(Value::as_f64).unwrap_or(0.0);
+            let gh = meta.get("h").and_then(Value::as_f64).unwrap_or(0.0);
+            if gw < 20.0 || gh < 20.0 {
+                log.push("img:bad-rect".to_string());
+                break;
+            }
+            // (Grid already settled at the top of the round.) Screenshot just the grid.
+            let png = session
+                .cdp_call(
+                    "Page.captureScreenshot",
+                    json!({ "format": "png", "clip": { "x": gx, "y": gy, "width": gw, "height": gh, "scale": 1 } }),
+                )
+                .ok()
+                .and_then(|v| v.get("data").and_then(Value::as_str).map(String::from))
+                .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok())
+                .unwrap_or_default();
+            if png.is_empty() {
+                log.push("img:no-shot".to_string());
+                break;
+            }
+            // Geometry diagnostics: dump the computed grid rect + a full-viewport
+            // screenshot so a blank/mis-clipped grid can be traced (the clipped
+            // grid PNG itself is saved by captcha_clip when PUFFER_CLIP_DEBUG set).
+            if std::env::var_os("PUFFER_CLIP_DEBUG").is_some() {
+                if let Some(dir) = std::env::var_os("HOME")
+                    .map(|h| std::path::PathBuf::from(h).join(".puffer").join("clip_debug"))
+                {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let full = session
+                        .cdp_call("Page.captureScreenshot", json!({ "format": "png" }))
+                        .ok()
+                        .and_then(|v| v.get("data").and_then(Value::as_str).map(String::from))
+                        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()).ok())
+                        .unwrap_or_default();
+                    if !full.is_empty() {
+                        let _ = std::fs::write(dir.join("full_viewport.png"), &full);
+                    }
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("geom.log")) {
+                        use std::io::Write as _;
+                        let _ = writeln!(
+                            f,
+                            "task={task} bf={} meta_x={} meta_y={} gx={gx:.1} gy={gy:.1} gw={gw:.1} gh={gh:.1} png_bytes={}",
+                            bf,
+                            meta.get("x").and_then(Value::as_f64).unwrap_or(-1.0),
+                            meta.get("y").and_then(Value::as_f64).unwrap_or(-1.0),
+                            png.len()
+                        );
+                    }
+                }
+            }
+            // 4×4 "area" challenges (one photo sliced into 16) are segmented with
+            // CLIPSeg — per-tile CLIP is weak when the object spans tiles. 3×3
+            // classification stays on the CLIP per-tile path. PUFFER_CLIPSEG=0
+            // forces the CLIP path for A/B during calibration.
+            let use_seg = rows == 4 && std::env::var("PUFFER_CLIPSEG").as_deref() != Ok("0");
+            let tiles = if use_seg {
+                match super::captcha_clipseg::segment_tiles(&png, &task, rows) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log.push(format!("img:clipseg-err:{e:#}"));
+                        break;
+                    }
+                }
+            } else {
+                match super::captcha_clip::classify_tiles(&png, &task, rows) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log.push(format!("img:detect-err:{e:#}"));
+                        break;
+                    }
+                }
+            };
+            // Matched tiles not already selected (these need clicking).
+            let sel: Vec<bool> = meta
+                .get("sel")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().map(|v| v.as_u64().unwrap_or(0) != 0).collect())
+                .unwrap_or_default();
+            let unselected: Vec<usize> = tiles
+                .iter()
+                .copied()
+                .filter(|&i| sel.get(i).copied() != Some(true))
+                .collect();
+            log.push(format!("img:{task}:{}m/{}new/{} sel={}", tiles.len(), unselected.len(), cells,
+                sel.iter().map(|b| if *b {'1'} else {'0'}).collect::<String>()));
+            if std::env::var_os("PUFFER_CLIP_DEBUG").is_some() {
+                if let Some(dbg) = meta.get("dbg") {
+                    log.push(format!("tdcls:{dbg}"));
+                }
+            }
+
+            if !unselected.is_empty() {
+                for i in &unselected {
+                    let (r, c) = (i / rows, i % rows);
+                    let cx = gx + (c as f64 + 0.5) * gw / rows as f64;
+                    let cy = gy + (r as f64 + 0.5) * gh / rows as f64;
+                    let _ = self.agent_click_at(backend_session_id, cx, cy, 1);
+                    thread::sleep(Duration::from_millis(rng.gen_range(40..110)));
+                }
+                verify_fails = 0;
+                // Dynamic challenges REPLACE clicked tiles with new images that fade
+                // in at STAGGERED times. Re-detecting too early reads a half-updated
+                // grid and misaligns picks. Wait until the grid STABILIZES — all
+                // images loaded AND the src list unchanged between two reads. This
+                // handles full / partial / zero replacement and count mismatches
+                // uniformly (unlike a "changed >= nclick" count, which never fires
+                // when reCAPTCHA replaces fewer tiles than were clicked).
+                let start_ms = std::env::var("PUFFER_CLIP_DYN_START").ok().and_then(|v| v.parse().ok()).unwrap_or(450u64);
+                let settle_ms = std::env::var("PUFFER_CLIP_DYN_SETTLE").ok().and_then(|v| v.parse().ok()).unwrap_or(350u64);
+                let max_wait_ms = std::env::var("PUFFER_CLIP_DYN_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(4500u64);
+                thread::sleep(Duration::from_millis(start_ms));
+                let mut elapsed = start_ms;
+                let mut prev: Option<Vec<String>> = None;
+                loop {
+                    let st = eval_in_frame(
+                        &session,
+                        bframe,
+                        "(()=>{const im=[...document.querySelectorAll('table td img')];const allc=im.length?im.every(i=>i.complete&&i.naturalWidth>0):false;return JSON.stringify({s:im.map(i=>i.src),allc:allc});})()",
+                    )
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .unwrap_or(Value::Null);
+                    let all_loaded = st.get("allc").and_then(Value::as_bool).unwrap_or(false);
+                    let cur: Vec<String> = st
+                        .get("s")
+                        .and_then(Value::as_array)
+                        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    // Stable = loaded + a real (non-empty) read that matches the prior
+                    // read. Requires ≥1 good read, so an eval hiccup (empty) can't
+                    // short-circuit the wait.
+                    let stable = all_loaded && !cur.is_empty() && prev.as_ref() == Some(&cur);
+                    if stable && elapsed >= start_ms + 150 {
+                        break;
+                    }
+                    if elapsed >= max_wait_ms {
+                        break;
+                    }
+                    if !cur.is_empty() {
+                        prev = Some(cur);
+                    }
+                    thread::sleep(Duration::from_millis(200));
+                    elapsed += 200;
+                }
+                thread::sleep(Duration::from_millis(settle_ms));
+                continue;
+            }
+
+            // No unselected matches remain on the CURRENT grid.
+            let any_selected = sel.iter().any(|&b| b);
+            if !any_selected {
+                // Nothing selected here — a detection miss / hard grid, or a fresh
+                // challenge that just replaced a verified one. Pressing Verify now
+                // would submit an EMPTY answer (marked wrong), so reload a fresh grid
+                // instead (bounded). Fixes "verify fired before the next challenge
+                // was solved".
+                if reloads >= max_reloads {
+                    log.push("img:give-up-reloads".to_string());
+                    break;
+                }
+                reloads += 1;
+                log.push(format!("img:reload-empty{reloads}"));
+                let _ = eval_in_frame(&session, bframe, "(()=>{const r=document.querySelector('#recaptcha-reload-button');if(r)r.click();})()");
+                thread::sleep(Duration::from_millis(rng.gen_range(1100..1700)));
+                continue;
+            }
+            // A real selection is complete → submit ONCE. Snapshot {task, img srcs}
+            // to classify the outcome afterward.
+            let pre_verify = eval_in_frame(
+                &session,
+                bframe,
+                "(()=>{const s=document.querySelector('.rc-imageselect-desc strong,strong');const im=[...document.querySelectorAll('table td img')].map(i=>i.src);return JSON.stringify({t:s?s.innerText:'',im:im});})()",
+            )
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+            .unwrap_or(Value::Null);
+            thread::sleep(Duration::from_millis(rng.gen_range(220..480)));
+            let _ = eval_in_frame(&session, bframe, "(()=>{const v=document.querySelector('#recaptcha-verify-button');if(v)v.click();})()");
+            // Poll for the outcome. Priorities: (1) the TOP-document response token is
+            // set ⇒ SOLVED (works even when `anchor` is None — the critical fix); (2)
+            // the "incorrect response" banner shows ⇒ REJECTED; (3) the grid actually
+            // changed (task or a NON-EMPTY img list differs) ⇒ advanced to the next
+            // step. Waiting here also stops a premature second Verify.
+            let mut advanced = false;
+            let mut rejected = false;
+            for _ in 0..16 {
+                thread::sleep(Duration::from_millis(200));
+                if recaptcha_solved(&session) {
+                    log.push("img:PASS".to_string());
+                    return (true, log);
+                }
+                let cur = eval_in_frame(
+                    &session,
+                    bframe,
+                    "(()=>{const s=document.querySelector('.rc-imageselect-desc strong,strong');const im=[...document.querySelectorAll('table td img')].map(i=>i.src);const e=document.querySelector('.rc-imageselect-incorrect-response');const errVis=e?(getComputedStyle(e).display!=='none'&&getComputedStyle(e).visibility!=='hidden'&&parseFloat(getComputedStyle(e).opacity||'1')>0.1):false;return JSON.stringify({t:s?s.innerText:'',im:im,err:errVis});})()",
+                )
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or(Value::Null);
+                if cur.get("err").and_then(Value::as_bool) == Some(true) {
+                    rejected = true;
+                    break;
+                }
+                let im_nonempty = cur.get("im").and_then(Value::as_array).map(|a| !a.is_empty()).unwrap_or(false);
+                let task_changed = cur.get("t") != pre_verify.get("t");
+                let imgs_changed = cur.get("im") != pre_verify.get("im");
+                if im_nonempty && (task_changed || imgs_changed) {
+                    advanced = true;
+                    break;
+                }
+            }
+            if advanced && !rejected {
+                // Legit multi-step chain — solve the next grid without counting a
+                // failure or giving up (fixes "puffer stops while challenges keep
+                // coming"). But bail out of an ENDLESS chain (low-trust trap).
+                next_steps += 1;
+                if next_steps > max_next_steps {
+                    log.push(format!("img:chain-too-long({next_steps})"));
+                    break;
+                }
+                log.push("img:next-step".to_string());
+                verify_fails = 0;
+                thread::sleep(Duration::from_millis(rng.gen_range(250..500)));
+                continue;
+            }
+            // Rejected (banner) or unchanged grid → the selection was wrong.
+            verify_fails += 1;
+            log.push(format!("img:verify-fail{verify_fails}(r{})", round + 1));
+            if verify_fails >= 2 {
+                if reloads >= max_reloads {
+                    log.push("img:give-up-reloads".to_string());
+                    break;
+                }
+                reloads += 1;
+                let _ = eval_in_frame(&session, bframe, "(()=>{const r=document.querySelector('#recaptcha-reload-button');if(r)r.click();})()");
+                thread::sleep(Duration::from_millis(rng.gen_range(1100..1700)));
+                verify_fails = 0;
+            } else {
+                thread::sleep(Duration::from_millis(rng.gen_range(450..800)));
+            }
+        }
+        (false, log)
+    }
+
+    /// Autonomous hook: if a reCAPTCHA is present on the page, solve it and return
+    /// the outcome; otherwise `None`. Called after navigation so Puffer clears a
+    /// captcha on its own before continuing the task (silent to the model).
+    #[cfg(feature = "captcha-audio")]
+    pub(crate) fn auto_solve_if_captcha(&self, backend_session_id: &str) -> Option<Value> {
+        // Escape hatch: PUFFER_CAPTCHA_NO_AUTO=1 lets a human open the challenge
+        // (click the checkbox) so Puffer only solves the shown grid — used to test
+        // the image solver without Puffer's own CDP checkbox click tripping the block.
+        if std::env::var_os("PUFFER_CAPTCHA_NO_AUTO").is_some() {
+            return None;
+        }
+        let session = self.get(backend_session_id).ok()?;
+        // The reCAPTCHA frames attach a few seconds AFTER navigation returns, so
+        // poll the frame tree (up to ~8s) rather than sampling once too early.
+        let mut present = false;
+        for _ in 0..16 {
+            thread::sleep(Duration::from_millis(500));
+            if let Ok((anchor, bframe)) = recaptcha_frame_ids(&session) {
+                if anchor.is_some() || bframe.is_some() {
+                    present = true;
+                    break;
+                }
+            }
+        }
+        if !present {
+            return None;
+        }
+        self.agent_solve_captcha(backend_session_id, 3).ok()
     }
 
     /// Focuses an element ref from the last agent snapshot.
@@ -1266,25 +2073,27 @@ fn coord_param(params: &Value, key: &str) -> Option<f64> {
         .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
 }
 
-/// Tiny deterministic sub-pixel wobble (~±1.5px) so a synthesized pointer path
-/// is not a perfectly straight line — no RNG dependency, varies by step.
-fn pointer_jitter(step: usize, salt: usize) -> f64 {
-    (((step * 37 + salt * 101) % 7) as f64 - 3.0) * 0.5
-}
-
-/// Moves the pointer to (x, y) over a few eased, slightly-jittered steps with
-/// small inter-step delays, ending exactly on the target. Approximates human
-/// pointer motion instead of an instantaneous teleport, which matters to
-/// behavioral anti-bot scoring (reCAPTCHA checkbox / v3).
+/// Moves the pointer to (x, y) along a RANDOMIZED curved (quadratic Bézier) path
+/// with per-step sub-pixel jitter and variable inter-step dwell, approaching from
+/// a random nearby point and settling exactly on the target. Real, non-repeating
+/// pointer telemetry — behavioral anti-bot scoring (reCAPTCHA checkbox / v3) both
+/// penalizes teleports and pattern-matches a fixed synthetic curve, so the path
+/// must vary each time rather than be deterministic.
 fn dispatch_humanized_move(session: &BrowserSession, x: f64, y: f64) -> Result<()> {
-    let start_x = x - 26.0;
-    let start_y = y - 19.0;
-    let steps = 4usize;
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let start_x = x - rng.gen_range(18.0..64.0);
+    let start_y = y - rng.gen_range(-30.0..44.0);
+    // Control point off the straight line gives the path a natural curve.
+    let ctrl_x = (start_x + x) / 2.0 + rng.gen_range(-28.0..28.0);
+    let ctrl_y = (start_y + y) / 2.0 + rng.gen_range(-28.0..28.0);
+    let steps = rng.gen_range(5..=9);
     for i in 1..=steps {
         let t = i as f64 / steps as f64;
-        let ease = t * t * (3.0 - 2.0 * t); // smoothstep
-        let mx = start_x + (x - start_x) * ease + pointer_jitter(i, 1);
-        let my = start_y + (y - start_y) * ease + pointer_jitter(i, 2);
+        let e = t * t * (3.0 - 2.0 * t); // smoothstep velocity profile
+        let iu = 1.0 - e;
+        let mx = iu * iu * start_x + 2.0 * iu * e * ctrl_x + e * e * x + rng.gen_range(-1.3..1.3);
+        let my = iu * iu * start_y + 2.0 * iu * e * ctrl_y + e * e * y + rng.gen_range(-1.3..1.3);
         session.input(BrowserInputEvent::Mouse {
             event_type: "mouseMoved".to_string(),
             x: mx,
@@ -1293,7 +2102,7 @@ fn dispatch_humanized_move(session: &BrowserSession, x: f64, y: f64) -> Result<(
             buttons: Some(0),
             click_count: 0,
         })?;
-        thread::sleep(Duration::from_millis(16 + (i as u64) * 8));
+        thread::sleep(Duration::from_millis(rng.gen_range(4..12)));
     }
     // Settle exactly on the target so the press lands where intended.
     session.input(BrowserInputEvent::Mouse {
@@ -1786,4 +2595,168 @@ mod tests {
             "timed out waiting for browser evaluation"
         )));
     }
+}
+
+/// Runs `expr` inside a cross-origin frame via an isolated world. Only works
+/// because Puffer disables site isolation, so the frame shares the renderer.
+/// Shared by the audio solver and the image fallback.
+#[cfg(any(feature = "captcha-audio", feature = "captcha-image"))]
+fn eval_in_frame(session: &BrowserSession, frame_id: &str, expr: &str) -> Result<Value> {
+    let world = session.cdp_call(
+        "Page.createIsolatedWorld",
+        json!({ "frameId": frame_id, "worldName": "puffer_captcha", "grantUniveralAccess": true }),
+    )?;
+    let ctx = world
+        .get("executionContextId")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("no execution context for frame {frame_id}"))?;
+    let resp = session.cdp_call(
+        "Runtime.evaluate",
+        json!({ "expression": expr, "contextId": ctx, "returnByValue": true, "awaitPromise": true }),
+    )?;
+    Ok(resp.pointer("/result/value").cloned().unwrap_or(Value::Null))
+}
+
+/// Universal "captcha solved" signal that does NOT depend on the (optional) anchor
+/// frame: reCAPTCHA sets the response token on the TOP document once ANY path
+/// (silent checkbox pass, audio, or image) succeeds. The image solver must use this
+/// — `anchor` is legitimately `None` when the frame poll captured only the bframe,
+/// and gating success on `Some(anchor)` would report a solved captcha as unsolved.
+#[cfg(any(feature = "captcha-audio", feature = "captcha-image"))]
+fn recaptcha_solved(session: &BrowserSession) -> bool {
+    session
+        .evaluate(
+            "(()=>{try{return !!(window.grecaptcha&&grecaptcha.getResponse&&grecaptcha.getResponse())}catch(e){return false}})()"
+                .to_string(),
+        )
+        .ok()
+        .and_then(|e| e.value.as_bool())
+        .unwrap_or(false)
+}
+
+/// Reads an attribute off a `DOM.getDocument` node (flat `[k,v,k,v,...]` array).
+#[cfg(feature = "captcha-audio")]
+fn dom_attr(node: &Value, name: &str) -> String {
+    let Some(arr) = node.get("attributes").and_then(Value::as_array) else {
+        return String::new();
+    };
+    let mut it = arr.iter();
+    while let (Some(k), Some(v)) = (it.next(), it.next()) {
+        if k.as_str() == Some(name) {
+            return v.as_str().unwrap_or_default().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Finds the reCAPTCHA v2 anchor (checkbox) and bframe (challenge) CDP frame ids
+/// by piercing the DOM (`DOM.getDocument { pierce: true }`). `Page.getFrameTree`
+/// does not surface these cross-site frames in Puffer's headless setup, but the
+/// pierced DOM does (site isolation is disabled, so they share the renderer).
+/// `(anchor, bframe)`.
+#[cfg(feature = "captcha-audio")]
+fn recaptcha_frame_ids(
+    session: &BrowserSession,
+) -> Result<(Option<String>, Option<String>)> {
+    fn walk(node: &Value, anchor: &mut Option<String>, bframe: &mut Option<String>) {
+        let is_iframe = node
+            .get("nodeName")
+            .and_then(Value::as_str)
+            .map(|n| n.eq_ignore_ascii_case("iframe"))
+            .unwrap_or(false);
+        if is_iframe {
+            let frame_id = node.get("frameId").and_then(Value::as_str);
+            let content = node.get("contentDocument");
+            let url = content
+                .and_then(|c| c.get("documentURL"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| dom_attr(node, "src"));
+            if let Some(fid) = frame_id {
+                if url.contains("/recaptcha/") && url.contains("/anchor") && anchor.is_none() {
+                    *anchor = Some(fid.to_string());
+                }
+                if url.contains("/recaptcha/") && url.contains("/bframe") && bframe.is_none() {
+                    *bframe = Some(fid.to_string());
+                }
+            }
+            if let Some(content) = content {
+                walk(content, anchor, bframe);
+            }
+        }
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk(child, anchor, bframe);
+            }
+        }
+    }
+    let doc = session.cdp_call("DOM.getDocument", json!({ "depth": -1, "pierce": true }))?;
+    let (mut anchor, mut bframe) = (None, None);
+    if let Some(root) = doc.get("root") {
+        walk(root, &mut anchor, &mut bframe);
+    }
+    Ok((anchor, bframe))
+}
+
+/// Debug: dump iframes (pierced DOM) + frame-tree urls to diagnose why a captcha
+/// wasn't found. Temporary aid for bring-up.
+#[cfg(feature = "captcha-audio")]
+fn recaptcha_debug(session: &BrowserSession) -> Vec<String> {
+    fn walk(node: &Value, out: &mut Vec<String>) {
+        if node
+            .get("nodeName")
+            .and_then(Value::as_str)
+            .map(|n| n.eq_ignore_ascii_case("iframe"))
+            .unwrap_or(false)
+        {
+            let fid = node.get("frameId").and_then(Value::as_str).unwrap_or("NONE");
+            let src: String = dom_attr(node, "src").chars().take(55).collect();
+            let durl: String = node
+                .get("contentDocument")
+                .and_then(|c| c.get("documentURL"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .take(55)
+                .collect();
+            out.push(format!(
+                "iframe fid={fid} content={} src={src} docURL={durl}",
+                node.get("contentDocument").is_some()
+            ));
+        }
+        if let Some(content) = node.get("contentDocument") {
+            walk(content, out);
+        }
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            for child in children {
+                walk(child, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(doc) = session.cdp_call("DOM.getDocument", json!({ "depth": -1, "pierce": true })) {
+        if let Some(root) = doc.get("root") {
+            walk(root, &mut out);
+        }
+    }
+    fn ftree(node: &Value, out: &mut Vec<String>) {
+        if let Some(frame) = node.get("frame") {
+            out.push(format!(
+                "ftree url={}",
+                frame.get("url").and_then(Value::as_str).unwrap_or("")
+            ));
+        }
+        if let Some(children) = node.get("childFrames").and_then(Value::as_array) {
+            for child in children {
+                ftree(child, out);
+            }
+        }
+    }
+    if let Ok(tree) = session.cdp_call("Page.getFrameTree", json!({})) {
+        if let Some(root) = tree.get("frameTree") {
+            ftree(root, &mut out);
+        }
+    }
+    out
 }

@@ -66,10 +66,36 @@ const CEF_TARGET_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// (reCAPTCHA checkbox / v3, Turnstile) check first.
 const STEALTH_INIT_SCRIPT: &str = r#"
 (() => {
-  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined }); } catch (e) {}
-  try { if (!window.chrome) window.chrome = { runtime: {} }; } catch (e) {}
-  try { Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] }); } catch (e) {}
-  try { Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] }); } catch (e) {}
+  const def = (o, p, v) => { try { Object.defineProperty(o, p, { get: () => v, configurable: true }); } catch (e) {} };
+  try { Object.defineProperty(navigator, 'webdriver', { get: () => undefined, configurable: true }); } catch (e) {}
+  // A fuller chrome object — bare {runtime:{}} is itself a bot tell.
+  try {
+    window.chrome = window.chrome || {};
+    window.chrome.runtime = window.chrome.runtime || {};
+    window.chrome.app = window.chrome.app || {
+      isInstalled: false,
+      InstallState: { DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed' },
+      RunningState: { CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running' },
+    };
+    if (!window.chrome.csi) window.chrome.csi = function () { return { startE: Date.now(), onloadT: Date.now(), pageT: 0, tran: 15 }; };
+    if (!window.chrome.loadTimes) window.chrome.loadTimes = function () { return { requestTime: Date.now() / 1000, startLoadTime: Date.now() / 1000, commitLoadTime: Date.now() / 1000, finishLoadTime: Date.now() / 1000, navigationType: 'Other' }; };
+  } catch (e) {}
+  def(navigator, 'languages', ['en-US', 'en']);
+  // Singular navigator.language too — leaving it at the OS locale (e.g. zh-CN)
+  // while `languages` claims en-US is itself an inconsistency, and it makes
+  // reCAPTCHA serve localized (Chinese) challenge words. Forcing en-US keeps the
+  // task label English so the CLIP text encoder gets a clean prompt.
+  def(navigator, 'language', 'en-US');
+  def(navigator, 'platform', 'MacIntel');
+  def(navigator, 'hardwareConcurrency', 8);
+  def(navigator, 'deviceMemory', 8);
+  // Plugins shaped like the real Chrome PDF set (an empty/fake array is a tell).
+  try {
+    const mk = (n, f) => ({ name: n, filename: f, description: 'Portable Document Format', length: 1 });
+    const arr = [mk('PDF Viewer', 'internal-pdf-viewer'), mk('Chrome PDF Viewer', 'internal-pdf-viewer'), mk('Chromium PDF Viewer', 'internal-pdf-viewer'), mk('Microsoft Edge PDF Viewer', 'internal-pdf-viewer'), mk('WebKit built-in PDF', 'internal-pdf-viewer')];
+    def(navigator, 'plugins', arr);
+    def(navigator, 'mimeTypes', [{ type: 'application/pdf', suffixes: 'pdf', description: '' }]);
+  } catch (e) {}
   try {
     const q = navigator.permissions && navigator.permissions.query;
     if (q) {
@@ -79,13 +105,19 @@ const STEALTH_INIT_SCRIPT: &str = r#"
           : q(p);
     }
   } catch (e) {}
+  // WebGL vendor/renderer for BOTH WebGL1 and WebGL2 (patching only v1 is a tell).
   try {
-    const gp = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function (p) {
-      if (p === 37445) return 'Intel Inc.';
-      if (p === 37446) return 'Intel Iris OpenGL Engine';
-      return gp.call(this, p);
+    const patch = (proto) => {
+      if (!proto) return;
+      const gp = proto.getParameter;
+      proto.getParameter = function (p) {
+        if (p === 37445) return 'Intel Inc.';
+        if (p === 37446) return 'Intel Iris OpenGL Engine';
+        return gp.call(this, p);
+      };
     };
+    patch(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+    patch(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
   } catch (e) {}
 })();
 "#;

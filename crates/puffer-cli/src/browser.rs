@@ -437,6 +437,18 @@ fn execute_browser_command(
                 internal_permission_required,
             )
         }
+        BrowserCommand::SolveCaptcha { rounds, target } => {
+            let mut payload = base_payload("solveCaptcha", session_id);
+            apply_target_args(&mut payload, &target);
+            insert_optional_u32(&mut payload, "count", rounds);
+            execute_agent_action(
+                handshake,
+                "solveCaptcha",
+                payload,
+                BrowserPrintKind::Value,
+                internal_permission_required,
+            )
+        }
     }
 }
 

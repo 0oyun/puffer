@@ -26,8 +26,13 @@ pub(super) fn configure_chrome_command(
     height: u32,
     launch_settings: &BrowserLaunchSettings,
 ) {
+    // Headed mode (PUFFER_BROWSER_HEADED=1) opens a visible window — used to log
+    // into Google once in the persistent profile so reСAPTCHA trusts the session
+    // (a signed-in user is rarely challenged/blocked). Default stays headless.
+    if std::env::var_os("PUFFER_BROWSER_HEADED").is_none() {
+        command.arg("--headless=new");
+    }
     command
-        .arg("--headless=new")
         .arg("--remote-debugging-port=0")
         .arg(format!(
             "--user-data-dir={}",
@@ -36,14 +41,41 @@ pub(super) fn configure_chrome_command(
         .arg("--no-first-run")
         .arg("--no-default-browser-check")
         .arg("--disable-background-networking")
-        // Stealth: hide the AutomationControlled blink flag and present a normal
-        // Chrome UA (the default headless UA leaks "HeadlessChrome"), so
-        // behavioral anti-bot checks see a less suspicious browser.
-        .arg("--disable-blink-features=AutomationControlled")
+        // NOTE: --disable-blink-features=AutomationControlled was removed — it makes
+        // Chrome show a visible "unsupported command-line flag" warning (itself an
+        // automation tell) and is redundant: STEALTH_INIT_SCRIPT already sets
+        // navigator.webdriver=undefined before any page script runs. Present a
+        // normal Chrome UA so the default headless UA doesn't leak "HeadlessChrome".
         .arg(
             "--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
              AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
-        )
+        );
+    // Captcha-support launch flags, GATED behind a captcha feature so a DEFAULT
+    // build is unaffected (keeps full site isolation and the OS locale). Only a
+    // build with `--features captcha` gets them:
+    //   * --disable-site-isolation-trials keeps reCAPTCHA's cross-origin anchor/
+    //     bframe frames in the page renderer so they're reachable via
+    //     Page.createIsolatedWorld (the solver reads/drives them there);
+    //   * --lang=en-US makes the Accept-Language header return English challenge/
+    //     task words for the audio + CLIP text paths.
+    if cfg!(any(feature = "captcha-audio", feature = "captcha-image")) {
+        command
+            .arg("--lang=en-US")
+            .arg("--disable-site-isolation-trials");
+    }
+    // Optionally route the browser through a proxy (PUFFER_BROWSER_PROXY, e.g. the
+    // clash endpoint) — needed when the machine's direct route can't reach google
+    // (so reCAPTCHA's api.js/iframes never load) but the proxy can. Loopback is
+    // bypassed so the local flask test page and DevTools stay direct.
+    if let Some(proxy) = std::env::var_os("PUFFER_BROWSER_PROXY") {
+        command
+            .arg(format!("--proxy-server={}", proxy.to_string_lossy()))
+            // Bypass loopback so the local flask test page stays direct — do NOT add
+            // the "<-loopback>" token, which FORCES loopback through the proxy and
+            // makes localhost:8799 fail with "Connection Closed".
+            .arg("--proxy-bypass-list=localhost;127.0.0.1");
+    }
+    command
         .arg("--disable-features=Translate,IsolateOrigins,site-per-process")
         .arg("--disable-gpu")
         .arg("--enable-extensions")

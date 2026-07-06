@@ -329,6 +329,65 @@ fn collect_payment_frames(tree_node: &Value, is_root: bool, out: &mut HashSet<St
     }
 }
 
+/// A CAPTCHA widget detected on the page by scanning the CDP frame tree for the
+/// vendor's iframe URLs. Cross-origin so the DOM snapshot can't see it; the
+/// frame tree still lists it by URL. Used to let the agent (and the autonomous
+/// solver) know a challenge is present without inspecting the iframe internals.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub(crate) struct CaptchaInfo {
+    /// "recaptcha_v2" | "hcaptcha" | "turnstile"
+    pub(crate) kind: &'static str,
+    /// The challenge popup frame is present (v2 bframe / hcaptcha challenge),
+    /// i.e. an image/interactive challenge is currently open (not just the box).
+    pub(crate) challenge_open: bool,
+}
+
+/// Detects a CAPTCHA from a `Page.getFrameTree` result by matching known vendor
+/// iframe URLs. Returns `None` when no captcha frame is present. reCAPTCHA v3 and
+/// invisible variants have no visible iframe and are intentionally not reported.
+pub(crate) fn detect_captcha_from_tree(frame_tree_result: &Value) -> Option<CaptchaInfo> {
+    let root = frame_tree_result.get("frameTree")?;
+    let mut urls = Vec::new();
+    collect_frame_urls(root, &mut urls);
+    let has = |needle: &str| urls.iter().any(|u| u.contains(needle));
+    let rc_anchor = has("/recaptcha/api2/anchor") || has("/recaptcha/enterprise/anchor");
+    let rc_bframe = has("/recaptcha/api2/bframe") || has("/recaptcha/enterprise/bframe");
+    if rc_anchor || rc_bframe {
+        return Some(CaptchaInfo {
+            kind: "recaptcha_v2",
+            challenge_open: rc_bframe,
+        });
+    }
+    if has("hcaptcha.com") {
+        return Some(CaptchaInfo {
+            kind: "hcaptcha",
+            challenge_open: has("hcaptcha.com/captcha") || has("/hcaptcha-challenge"),
+        });
+    }
+    if has("challenges.cloudflare.com") {
+        return Some(CaptchaInfo {
+            kind: "turnstile",
+            challenge_open: false,
+        });
+    }
+    None
+}
+
+fn collect_frame_urls(tree_node: &Value, out: &mut Vec<String>) {
+    if let Some(url) = tree_node
+        .get("frame")
+        .and_then(|f| f.get("url"))
+        .and_then(Value::as_str)
+    {
+        out.push(url.to_string());
+    }
+    if let Some(children) = tree_node.get("childFrames").and_then(Value::as_array) {
+        for child in children {
+            collect_frame_urls(child, out);
+        }
+    }
+}
+
 /// Promotes collected in-frame fields to agent refs, numbering them after the
 /// top-document refs (`start_index`). A field without a resolved top-viewport
 /// quad center is dropped: a ref the runtime can't click is worse than none.
@@ -541,11 +600,19 @@ impl BrowserRegistry {
             .lock()
             .unwrap()
             .insert(backend_session_id.to_string(), elements.clone());
+        // Cheap frame-tree scan for a CAPTCHA widget (cross-origin, invisible to
+        // the DOM snapshot). Best-effort — never fail the snapshot over it.
+        let captcha = session
+            .cdp_call("Page.getFrameTree", json!({}))
+            .ok()
+            .and_then(|tree| detect_captcha_from_tree(&tree))
+            .map(|c| json!({ "kind": c.kind, "challengeOpen": c.challenge_open }));
         Ok(json!({
             "url": snapshot.url,
             "title": snapshot.title,
             "text": snapshot.text,
             "elements": elements,
+            "captcha": captcha,
             "instruction": SNAPSHOT_INSTRUCTION
         }))
     }

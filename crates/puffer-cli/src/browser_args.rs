@@ -311,4 +311,14 @@ pub(crate) enum BrowserCommand {
         #[command(flatten)]
         target: BrowserTargetArgs,
     },
+    /// Autonomously solve a reCAPTCHA v2 on the active tab via its audio
+    /// challenge and a local whisper model (feature `captcha-audio`).
+    #[command(name = "solve-captcha")]
+    SolveCaptcha {
+        /// Maximum solve rounds (default 3).
+        #[arg(long = "rounds")]
+        rounds: Option<u32>,
+        #[command(flatten)]
+        target: BrowserTargetArgs,
+    },
 }
