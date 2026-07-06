@@ -83,8 +83,26 @@ base64 = { workspace = true }
 # on Windows); we stick to the 6.x line for its simple synchronous callback API.
 notify = "6"
 
+# Autonomous reСAPTCHA v2 audio solving (feature: captcha-audio). whisper-rs
+# bundles whisper.cpp (built via cmake/clang at compile time); symphonia decodes
+# the challenge mp3 to PCM for transcription. Optional so builds that don't need
+# captcha solving stay lean.
+whisper-rs = { version = "0.14", optional = true }
+symphonia = { version = "0.5", optional = true, default-features = false, features = ["mp3"] }
+# reCAPTCHA v2 IMAGE-challenge fallback (feature: captcha-image). Native ONNX
+# inference (ort bundles onnxruntime) + image preprocessing — no Python. Used
+# when the audio challenge is blocked ("try again later").
+ort = { version = "2.0.0-rc.12", optional = true }
+image = { version = "0.25", optional = true, default-features = false, features = ["png", "jpeg"] }
+# CLIP open-vocabulary tile classifier (feature: captcha-image). Loads CLIP's
+# byte-level BPE straight from tokenizer.json — no vocab/merges, no Python.
+tokenizers = { version = "0.20", optional = true, default-features = false, features = ["onig"] }
+
 [features]
 default = []
+captcha-audio = ["dep:whisper-rs", "dep:symphonia"]
+captcha-image = ["dep:ort", "dep:image", "dep:tokenizers"]
+captcha = ["captcha-audio", "captcha-image"]
 connector-telegram = ["dep:puffer-connector-telegram"]
 connector-discord = ["dep:puffer-connector-discord"]
 connector-slack = ["dep:puffer-connector-slack"]
